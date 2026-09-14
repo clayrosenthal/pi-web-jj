@@ -1,0 +1,44 @@
+{
+    "name": "pi-web-jj",
+    "version": "0.1.0",
+    "description": "Jujutsu (jj) workspace provider and panel for PI WEB",
+    "license": "Apache-2.0",
+    "type": "module",
+    "keywords": [
+        "pi-package",
+        "pi-web",
+        "pi-web-plugin",
+        "jj",
+        "jujutsu"
+    ],
+    "files": [
+        "dist",
+        "README.md"
+    ],
+    "scripts": {
+        "build": "tsc -p tsconfig.json",
+        "check": "tsc -p tsconfig.json --noEmit",
+        "clean": "rm -rf dist"
+    },
+    "devDependencies": {
+        "@jmfederico/pi-web": "^1.202608.2",
+        "@types/node": "^24.13.3",
+        "@typescript-eslint/eslint-plugin": "^8.70.0",
+        "@typescript-eslint/parser": "^8.70.0",
+        "eslint": "^10.10.0",
+        "eslint-config-prettier": "^10.1.8",
+        "prettier": "^3.9.6",
+        "typescript": "^5.9.3"
+    },
+    "piWeb": {
+        "plugins": [
+            {
+                "id": "jj",
+                "browserRoot": "dist/browser",
+                "module": "dist/browser/index.js",
+                "serverModule": "dist/server.js",
+                "machineSpecific": true
+            }
+        ]
+    }
+}

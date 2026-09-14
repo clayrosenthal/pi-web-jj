@@ -1,0 +1,16 @@
+# yaml format
+printWidth: 120
+tabWidth: 4
+singleQuote: true
+trailingComma: 'all'
+overrides:
+  - files:
+      - '*.yaml'
+      - '*.yml'
+      - '.prettierrc'
+    options:
+      tabWidth: 2
+  - files:
+      - 'cdk.context.json'
+    options:
+      tabWidth: 2
