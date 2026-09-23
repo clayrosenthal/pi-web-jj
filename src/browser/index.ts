@@ -97,7 +97,7 @@ function stateKey(context: WorkspacePanelContext): string {
 const PANEL_ID = 'workspace.jj';
 
 const plugin: PiWebPlugin = {
-    apiVersion: 2,
+    apiVersion: 4,
     name: 'Jujutsu',
     activate: ({ pluginId, runtimePluginId, html, svg }) => {
         const owns = (workspace: { provider?: { pluginId: string } } | undefined): boolean =>
@@ -186,13 +186,16 @@ const plugin: PiWebPlugin = {
                             const n = s?.status?.stack.filter((c) => !c.immutable && !c.empty).length ?? 0;
                             return n > 0 ? n : undefined;
                         },
+                        // Refresh on manual invalidation and whenever the host reports
+                        // workspace file changes (agent edits, terminal commands).
+                        invalidationResources: ['workspace.files'],
                         onInvalidate: async (context) => {
                             await loadStatus(context, { reloadDiff: true });
                         },
                         render: (context) => {
                             const state = stateFor(context);
                             lastPanelContext.set(context.workspace.id, context);
-                            if (!state.initialized && context.backend !== undefined) {
+                            if (!state.initialized && hasPeer(context)) {
                                 state.initialized = true;
                                 void loadStatus(context, { reloadDiff: false });
                             }
@@ -214,7 +217,7 @@ export default plugin;
 type Html = Parameters<PiWebPlugin['activate']>[0]['html'];
 
 function renderPanel(context: WorkspacePanelContext, state: PanelState, html: Html) {
-    const backendMissing = context.backend === undefined;
+    const backendMissing = !hasPeer(context);
     const status = state.status;
     return html`
         <style .textContent=${panelStyles}></style>
@@ -505,14 +508,18 @@ function renderOpLog(state: PanelState, html: Html) {
 // Backend calls
 // ---------------------------------------------------------------------------
 
+function hasPeer(context: WorkspacePanelContext): boolean {
+    return context.peer?.request !== undefined;
+}
+
 async function request(context: WorkspacePanelContext, operation: string, input: JsonValue): Promise<JsonValue> {
-    if (context.backend === undefined) throw new Error('The jj backend is unavailable');
-    return context.backend.request(operation, input);
+    if (context.peer?.request === undefined) throw new Error('The jj backend is unavailable');
+    return context.peer.request(operation, input);
 }
 
 async function loadStatus(context: WorkspacePanelContext, options: { reloadDiff: boolean }): Promise<void> {
     const state = stateFor(context);
-    if (context.backend === undefined) return;
+    if (!hasPeer(context)) return;
     state.statusLoading = true;
     state.error = undefined;
     context.host.requestRender();

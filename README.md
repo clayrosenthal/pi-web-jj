@@ -39,7 +39,7 @@ Then reload the browser. Check **Settings → PI WEB plugins** shows `jj` as act
 Restarting `pi-web-sessiond` interrupts running sessions — do it from a shell,
 not from a pi session.
 
-Requires PI WEB `1.202608.2`+ and jj `0.43`+ on the login-shell `PATH` of the
+Requires PI WEB `1.202609.1`+ (browser plugin API v4, server API v3) and jj `0.43`+ on the login-shell `PATH` of the
 session daemon (mise shims via `~/.zprofile` are fine).
 
 ## Settings
@@ -68,7 +68,7 @@ Settings are captured at sessiond start.
 
 ## Backend operations
 
-For other browser plugins calling `backend.request()` on a jj-owned workspace:
+Served through the package peer (`context.peer.request(op, input)` from this plugin's browser entry):
 
 | op                 | input                                      | result                                                                        |
 | ------------------ | ------------------------------------------ | ----------------------------------------------------------------------------- |

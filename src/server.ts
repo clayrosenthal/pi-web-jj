@@ -7,11 +7,12 @@ import type {
     ProjectInput,
     ProviderClaim,
     ProviderRemoveContext,
-    ProviderRequestContext,
     ProviderWorkspace,
     ServerPluginActivationContext,
     ServerPluginExecFileResult,
     ServerPluginHealth,
+    ServerPluginPeer,
+    ServerPluginPeerRequestContext,
     WorkspaceProvider,
     WorkspaceRemovePlan,
 } from '@jmfederico/pi-web/server-plugin-api';
@@ -35,7 +36,7 @@ interface Settings {
 }
 
 const plugin: PiWebServerPlugin = {
-    apiVersion: 1,
+    apiVersion: 3,
     name: 'Jujutsu',
     async activate(context) {
         const settings = readSettings(context.settings);
@@ -52,8 +53,10 @@ const plugin: PiWebServerPlugin = {
         } catch (error) {
             context.logger.warn('jj is not available; provider will report unhealthy', { error: errorMessage(error) });
         }
+        const { workspaceProvider, peer } = createWorkspaceProvider(jj, settings);
         return {
-            workspaceProvider: createWorkspaceProvider(jj, settings),
+            workspaceProvider,
+            peer,
             health(): ServerPluginHealth {
                 return version === undefined
                     ? { status: 'unhealthy', message: `jj executable not found (${settings.jjPath})` }
@@ -216,7 +219,10 @@ interface ResolvedWorkspaces {
     stale: string[];
 }
 
-function createWorkspaceProvider(jj: JjRunner, settings: Settings): WorkspaceProvider {
+function createWorkspaceProvider(
+    jj: JjRunner,
+    settings: Settings,
+): { workspaceProvider: WorkspaceProvider; peer: ServerPluginPeer } {
     async function resolveWorkspaces(project: ProjectInput, signal: AbortSignal): Promise<ResolvedWorkspaces> {
         const listResult = await requireJj(
             jj(project.path, ['workspace', 'list', '-T', 'json(self) ++ "\\n"'], signal),
@@ -262,7 +268,140 @@ function createWorkspaceProvider(jj: JjRunner, settings: Settings): WorkspacePro
         return join(dirname(project.path), '.jj-workspaces', basename(project.path));
     }
 
-    return {
+    async function request(context: ServerPluginPeerRequestContext): Promise<JsonValue> {
+        const { project, workspace, operation, input, signal } = context;
+        signal.throwIfAborted();
+        // Peer requests carry the browser-visible projection, not the provider key;
+        // the jj workspace name travels in publicMetadata.
+        const workspaceName = workspaceNameOf(workspace);
+        const cwd = workspace.path;
+        const inputObject = isJsonObject(input) ? input : {};
+
+        switch (operation) {
+            case 'status': {
+                const logResult = await requireJj(
+                    jj(cwd, ['log', '--no-graph', '-r', STACK_REVSET, '-T', COMMIT_TEMPLATE], signal),
+                    'read the jj stack',
+                );
+                const stack = parseCommits(logResult.stdout);
+                const where = stack.find((c) => c.isWorkingCopy);
+                // Conflicts anywhere in the mutable graph (a `jj pull` rebases every stack).
+                let conflicts: Commit[] = [];
+                try {
+                    const conflictResult = await requireJj(
+                        jj(cwd, ['log', '--no-graph', '-r', 'conflicts() & mutable()', '-T', COMMIT_TEMPLATE], signal),
+                        'list conflicted changes',
+                    );
+                    conflicts = parseCommits(conflictResult.stdout);
+                } catch {
+                    // decorative
+                }
+                const { stale } = await resolveWorkspaces(project, signal).catch(() => ({ stale: [] as string[] }));
+                return {
+                    workspace: workspaceName,
+                    where: where === undefined ? null : commitToJson(where),
+                    stack: stack.map(commitToJson),
+                    conflicts: conflicts.map(commitToJson),
+                    staleWorkspaces: stale,
+                };
+            }
+
+            case 'diff': {
+                const args = ['diff', '--git'];
+                const revision = optionalRevision(inputObject, 'revision');
+                const from = optionalRevision(inputObject, 'from');
+                const to = optionalRevision(inputObject, 'to');
+                if (from !== undefined || to !== undefined) {
+                    args.push('--from', from ?? 'trunk()', '--to', to ?? '@');
+                } else {
+                    args.push('-r', revision ?? '@');
+                }
+                const path = inputObject['path'];
+                if (typeof path === 'string' && path !== '') args.push('--', path);
+                const result = await requireJj(jj(cwd, args, signal), 'compute the jj diff');
+                const truncated = result.stdoutTruncated || result.stdout.length > MAX_PATCH_CHARS;
+                return { patch: result.stdout.slice(0, MAX_PATCH_CHARS), truncated };
+            }
+
+            case 'files': {
+                const args = ['diff', '--summary'];
+                const revision = optionalRevision(inputObject, 'revision');
+                const from = optionalRevision(inputObject, 'from');
+                const to = optionalRevision(inputObject, 'to');
+                if (from !== undefined || to !== undefined) {
+                    args.push('--from', from ?? 'trunk()', '--to', to ?? '@');
+                } else {
+                    args.push('-r', revision ?? '@');
+                }
+                const result = await requireJj(jj(cwd, args, signal), 'list changed files');
+                return result.stdout
+                    .split('\n')
+                    .filter((line) => line.trim() !== '')
+                    .map((line) => ({ status: line.slice(0, 1), path: line.slice(2) }));
+            }
+
+            case 'oplog': {
+                const limit = clampInt(inputObject['limit'], 1, 100, 20);
+                const result = await requireJj(
+                    jj(cwd, ['op', 'log', '--no-graph', '--limit', String(limit), '-T', 'json(self) ++ "\\n"'], signal),
+                    'read the jj operation log',
+                );
+                return result.stdout
+                    .split('\n')
+                    .filter((line) => line.trim() !== '')
+                    .map((line) => {
+                        const raw = JSON.parse(line) as Record<string, unknown>;
+                        const time = isJsonObject(raw['time']) ? raw['time'] : {};
+                        return {
+                            id: str(raw['id']).slice(0, 12),
+                            description: str(raw['description']),
+                            time: str(time['end'] ?? time['start']),
+                            snapshot: raw['is_snapshot'] === true,
+                            workspace: str(raw['workspace_name']),
+                        };
+                    });
+            }
+
+            case 'snapshot': {
+                // The one read that deliberately lets jj snapshot the working copy.
+                await requireJj(jj(cwd, ['status'], signal, { snapshot: true }), 'snapshot the working copy');
+                return { ok: true };
+            }
+
+            case 'workspace.add': {
+                const name = requireWorkspaceName(inputObject['name']);
+                const revision = optionalRevision(inputObject, 'revision');
+                const baseDir = workspaceBaseDir(project);
+                const destination = join(baseDir, name);
+                if (await exists(destination)) throw new Error(`Destination already exists: ${destination}`);
+                await mkdir(baseDir, { recursive: true });
+                const args = ['workspace', 'add', destination, '--name', name];
+                if (revision !== undefined) args.push('-r', revision);
+                // jj refuses `workspace add` under --ignore-working-copy; this is a
+                // user-initiated mutation, so snapshotting the main working copy is expected.
+                await requireJj(
+                    jj(project.path, args, signal, { snapshot: true, timeoutMs: 25_000 }),
+                    `add jj workspace "${name}"`,
+                );
+                return { name, path: destination };
+            }
+
+            case 'workspace.forget': {
+                const name = requireWorkspaceName(inputObject['name']);
+                if (name === DEFAULT_WORKSPACE_NAME) throw new Error('The default workspace cannot be forgotten');
+                await requireJj(
+                    jj(project.path, ['workspace', 'forget', name], signal),
+                    `forget jj workspace "${name}"`,
+                );
+                return { ok: true, name };
+            }
+
+            default:
+                throw new Error(`Unsupported jj workspace operation: ${operation}`);
+        }
+    }
+
+    const workspaceProvider: WorkspaceProvider = {
         async probe(project: ProjectInput, signal: AbortSignal): Promise<ProviderClaim> {
             signal.throwIfAborted();
             try {
@@ -309,144 +448,6 @@ function createWorkspaceProvider(jj: JjRunner, settings: Settings): WorkspacePro
             });
         },
 
-        async request(context: ProviderRequestContext): Promise<JsonValue> {
-            const { project, workspace, operation, input, signal } = context;
-            signal.throwIfAborted();
-            const cwd = workspace.path;
-            const inputObject = isJsonObject(input) ? input : {};
-
-            switch (operation) {
-                case 'status': {
-                    const logResult = await requireJj(
-                        jj(cwd, ['log', '--no-graph', '-r', STACK_REVSET, '-T', COMMIT_TEMPLATE], signal),
-                        'read the jj stack',
-                    );
-                    const stack = parseCommits(logResult.stdout);
-                    const where = stack.find((c) => c.isWorkingCopy);
-                    // Conflicts anywhere in the mutable graph (a `jj pull` rebases every stack).
-                    let conflicts: Commit[] = [];
-                    try {
-                        const conflictResult = await requireJj(
-                            jj(
-                                cwd,
-                                ['log', '--no-graph', '-r', 'conflicts() & mutable()', '-T', COMMIT_TEMPLATE],
-                                signal,
-                            ),
-                            'list conflicted changes',
-                        );
-                        conflicts = parseCommits(conflictResult.stdout);
-                    } catch {
-                        // decorative
-                    }
-                    const { stale } = await resolveWorkspaces(project, signal).catch(() => ({ stale: [] as string[] }));
-                    return {
-                        workspace: workspace.key,
-                        where: where === undefined ? null : commitToJson(where),
-                        stack: stack.map(commitToJson),
-                        conflicts: conflicts.map(commitToJson),
-                        staleWorkspaces: stale,
-                    };
-                }
-
-                case 'diff': {
-                    const args = ['diff', '--git'];
-                    const revision = optionalRevision(inputObject, 'revision');
-                    const from = optionalRevision(inputObject, 'from');
-                    const to = optionalRevision(inputObject, 'to');
-                    if (from !== undefined || to !== undefined) {
-                        args.push('--from', from ?? 'trunk()', '--to', to ?? '@');
-                    } else {
-                        args.push('-r', revision ?? '@');
-                    }
-                    const path = inputObject['path'];
-                    if (typeof path === 'string' && path !== '') args.push('--', path);
-                    const result = await requireJj(jj(cwd, args, signal), 'compute the jj diff');
-                    const truncated = result.stdoutTruncated || result.stdout.length > MAX_PATCH_CHARS;
-                    return { patch: result.stdout.slice(0, MAX_PATCH_CHARS), truncated };
-                }
-
-                case 'files': {
-                    const args = ['diff', '--summary'];
-                    const revision = optionalRevision(inputObject, 'revision');
-                    const from = optionalRevision(inputObject, 'from');
-                    const to = optionalRevision(inputObject, 'to');
-                    if (from !== undefined || to !== undefined) {
-                        args.push('--from', from ?? 'trunk()', '--to', to ?? '@');
-                    } else {
-                        args.push('-r', revision ?? '@');
-                    }
-                    const result = await requireJj(jj(cwd, args, signal), 'list changed files');
-                    return result.stdout
-                        .split('\n')
-                        .filter((line) => line.trim() !== '')
-                        .map((line) => ({ status: line.slice(0, 1), path: line.slice(2) }));
-                }
-
-                case 'oplog': {
-                    const limit = clampInt(inputObject['limit'], 1, 100, 20);
-                    const result = await requireJj(
-                        jj(
-                            cwd,
-                            ['op', 'log', '--no-graph', '--limit', String(limit), '-T', 'json(self) ++ "\\n"'],
-                            signal,
-                        ),
-                        'read the jj operation log',
-                    );
-                    return result.stdout
-                        .split('\n')
-                        .filter((line) => line.trim() !== '')
-                        .map((line) => {
-                            const raw = JSON.parse(line) as Record<string, unknown>;
-                            const time = isJsonObject(raw['time']) ? raw['time'] : {};
-                            return {
-                                id: str(raw['id']).slice(0, 12),
-                                description: str(raw['description']),
-                                time: str(time['end'] ?? time['start']),
-                                snapshot: raw['is_snapshot'] === true,
-                                workspace: str(raw['workspace_name']),
-                            };
-                        });
-                }
-
-                case 'snapshot': {
-                    // The one read that deliberately lets jj snapshot the working copy.
-                    await requireJj(jj(cwd, ['status'], signal, { snapshot: true }), 'snapshot the working copy');
-                    return { ok: true };
-                }
-
-                case 'workspace.add': {
-                    const name = requireWorkspaceName(inputObject['name']);
-                    const revision = optionalRevision(inputObject, 'revision');
-                    const baseDir = workspaceBaseDir(project);
-                    const destination = join(baseDir, name);
-                    if (await exists(destination)) throw new Error(`Destination already exists: ${destination}`);
-                    await mkdir(baseDir, { recursive: true });
-                    const args = ['workspace', 'add', destination, '--name', name];
-                    if (revision !== undefined) args.push('-r', revision);
-                    // jj refuses `workspace add` under --ignore-working-copy; this is a
-                    // user-initiated mutation, so snapshotting the main working copy is expected.
-                    await requireJj(
-                        jj(project.path, args, signal, { snapshot: true, timeoutMs: 25_000 }),
-                        `add jj workspace "${name}"`,
-                    );
-                    return { name, path: destination };
-                }
-
-                case 'workspace.forget': {
-                    const name = requireWorkspaceName(inputObject['name']);
-                    if (name === DEFAULT_WORKSPACE_NAME) throw new Error('The default workspace cannot be forgotten');
-                    await requireJj(
-                        jj(project.path, ['workspace', 'forget', name], signal),
-                        `forget jj workspace "${name}"`,
-                    );
-                    return { ok: true, name };
-                }
-
-                default:
-                    throw new Error(`Unsupported jj workspace operation: ${operation}`);
-            }
-        },
-
         async prepareRemove({ project, workspace, signal }: ProviderRemoveContext): Promise<WorkspaceRemovePlan> {
             signal.throwIfAborted();
             const name = workspace.key;
@@ -474,11 +475,19 @@ function createWorkspaceProvider(jj: JjRunner, settings: Settings): WorkspacePro
             };
         },
     };
+
+    return { workspaceProvider, peer: { request } };
 }
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+function workspaceNameOf(workspace: ServerPluginPeerRequestContext['workspace']): string {
+    const name = workspace.provider?.metadata?.['workspace'];
+    if (typeof name === 'string' && WORKSPACE_NAME_RE.test(name)) return name;
+    return workspace.isMain ? DEFAULT_WORKSPACE_NAME : workspace.label;
+}
 
 function optionalRevision(input: JsonObject, key: string): string | undefined {
     const value = input[key];
